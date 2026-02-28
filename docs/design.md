@@ -65,6 +65,11 @@ interface Vertex {
 }
 ```
 
+**実装仕様**
+
+* `connectionType: 'sharp'` は曲線分割点として扱う。該当頂点でパスを分割して `M` を再開する。
+* `connectionType: 'smooth'` は通常のスプライン制御点として扱う。
+
 ### 3.2. 線 (Line) - ★矢印プロパティの追加
 
 ```ts
@@ -85,6 +90,12 @@ interface Line {
 }
 ```
 
+**実装仕様**
+
+* `vertexIds` は長さ2以上を保証。
+* `vertexIds` に同一IDの重複は禁止（ループは別Lineとして閉じる）。
+* `arrowType: forward` は `vertexIds[0] -> vertexIds[vertexIds.length - 1]` 方向とする。
+
 ### 3.3. 閉じた図形 (ObjectShape)
 
 ```ts
@@ -98,6 +109,10 @@ interface ObjectShape {
 }
 ```
 
+**実装仕様**
+
+* `vertexIds` は閉路順で並べる。先頭と末尾は一致させない（描画時に閉じる）。
+
 ## 4. システムアーキテクチャ詳細
 
 ### 4.1. Geometry Engine (幾何計算層)
@@ -110,10 +125,27 @@ AppStateを受け取り、描画用データを算出する。
    - ![][image1] と ![][image2] の座標から ![][image3] を計算し、矢印の回転角を決定。
 3. **重心計算**: ObjectShape のテキスト配置用座標を算出。
 
+**実装仕様**
+
+* Catmull-Rom は centripetal (alpha=0.5) を採用。
+* 開曲線の端点は仮想点を反射生成（`P-1 = 2*P0 - P1`, `P(n+1) = 2*Pn - P(n-1)`）。
+* `connectionType: 'sharp'` の頂点でスプラインを分割し、`M` を再開始。
+* 矢印角度は端点近傍の接線で算出。
+  - 始点: `v = P1 - P0`
+  - 終点: `v = Pn - P(n-1)`
+  - 角度: `atan2(v.y, v.x)`
+* 共有頂点(degree>1)で矢印が重なる場合は `refX` を `strokeWidth * 1.5` 前方にオフセット。
+
 ### 4.2. Rendering Engine (描画層)
 
 1. **SVG Markers**: 矢印は SVG の `<marker>` 要素として定義。
 2. **Dynamic Rendering**: Line.arrowType に基づき、marker-start または marker-end 属性をパスに付与。
+
+**実装仕様**
+
+* `markerUnits="strokeWidth"` を使用して線幅に追従。
+* `viewBox="0 0 10 7"`, `refX=9`, `refY=3.5` を基準とする。
+* `overflow: visible` を指定して太線での切り欠けを防止。
 
 ## 5. コア・アルゴリズム設計
 
@@ -131,16 +163,35 @@ AppStateを受け取り、描画用データを算出する。
 
 * **衝突回避**: 頂点が別の線と共有（スナップ）されている場合、共有頂点においては矢印をわずかにオフセットさせるロジックを Geometry Engine に含める。
 
+**実装仕様**
+
+* 共有頂点の次数 `degree` を計算し、同一点から出る線に順序オフセットを付与。
+* オフセット量は `strokeWidth * 1.0` を基準に `(-k ... +k)` で分配する。
+
 ### 5.2. 閉路検出とオブジェクト昇格
 
 1. **グラフ構築**: vertices をノード、lines をエッジとする隣接リストを作成。
 2. **DFS (深さ優先探索)**: 新たな結合が発生した際、最小閉路を探索。
 3. **昇格**: 閉路が見つかった場合、その領域を塗る ObjectShape を生成。
 
+**実装仕様**
+
+* グラフは無向として扱う。
+* 最小閉路は「辺数最小の単純サイクル」と定義。
+* 検索は新規エッジ周辺に限定して性能を確保。
+* 同一頂点を含む多重閉路は最短サイクルのみ昇格。
+
 ### 5.3. スナップと頂点の融合
 
 * 二つの頂点が一定距離（THRESHOLD）に近づいた際、一方のIDに統合。  
 * 統合後、全 Line.vertexIds 内の旧IDを新IDへ置換。
+
+**実装仕様**
+
+* THRESHOLD 初期値は 8px（UIで変更可能）。
+* `keptId` はドラッグ中ではない方を優先（位置の安定性）。
+* `connectionType` は `sharp` を優先し、座標は `keptId` を採用。
+* マージは `MergeVertices` アクション経由で実行し、Undoに対応する。
 
 ## 6. レイヤー間 API 仕様 (Actions)
 
@@ -153,10 +204,28 @@ type MoveVertexPayload = { vertexId: string; x: number; y: number };
 type MergeVerticesPayload = { keptId: string; removedId: string };
 ```
 
+**追加アクション（実装に必須）**
+
+```ts
+type CreateVertexPayload = { vertexId: string; x: number; y: number; connectionType: ConnectionType };
+type CreateLinePayload = { lineId: string; vertexIds: string[]; strokeColor: string; strokeWidth: number };
+type AddVertexToLinePayload = { lineId: string; vertexId: string; index: number };
+type RemoveVertexPayload = { vertexId: string };
+type RemoveLinePayload = { lineId: string };
+type ToggleArrowPayload = { lineId: string };
+type SetConnectionTypePayload = { vertexId: string; connectionType: ConnectionType };
+```
+
 ## 7. エッジケースと UX 上の制約
 
 * **矢印の向きの自動反転**: ユーザーが線を引く方向に依存せず、後から UI で「向き」をトグルできる必要がある。  
 * **分岐点での矢印**: 一つの頂点から複数の矢印が出る場合、矢印同士が重ならないよう refX を動的に調整する。
+
+**実装仕様**
+
+* 矢印方向は UI から `none/forward/backward/both` を選択可能とする。
+* `forward/backward` の向き判定は `vertexIds` の順序で固定し、描画順の反転は行わない。
+* スナップ時はゴースト円でマージ位置を提示する。
 
 ## 8. 開発ロードマップ
 
